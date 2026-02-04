@@ -63,8 +63,17 @@
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
 #include "ggml-cuda/tri.cuh"
+
+#ifdef GGML_USE_HIP
+#include "ggml-cuda/gfx906/matmul/mmf.cuh"
+#endif
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+
+#if defined(GGML_USE_HIP) && GFX906_KVQ_MOE_CACHE_ENABLED
+#include "ggml-cuda/gfx906/fused/graph-fusion.cuh"
+#endif
+
 #include "ggml.h"
 
 #include <algorithm>
@@ -604,6 +613,10 @@ static std::atomic<int> ggml_cuda_lock_counter;
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+#if defined(GGML_USE_HIP) && GFX906_KVQ_MOE_CACHE_ENABLED
+    q8_cache.free_all();
+#endif
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -1763,6 +1776,21 @@ static void ggml_cuda_op_mul_mat_cublas(
                                         || cc == GGML_CUDA_CC_VOLTA
                                         || force_compute_type.fp32))
         {
+//        if (GGML_CUDA_CC_IS_CDNA(cc) || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_GCN(cc)) {
+#ifdef GGML_USE_HIP
+            // GFX906 custom FP16 GEMM for medium batch sizes (9-2048)
+            bool handled = false;
+            if (GGML_CUDA_CC_IS_GCN(cc)) {
+                handled = gfx906_mmf_dispatch(
+                    src0_ptr, src1_ptr, dst_dd_i,
+                    (int)row_diff, (int)src1_ncols, (int)ne10,
+                    (int)ne00, (int)ne10, (int)ldc,
+                    stream
+                );
+            }
+            if (!handled)
+#endif
+            {
             const float alpha = 1.0f;
             const float beta = 0.0f;
             CUBLAS_CHECK(
@@ -1773,6 +1801,7 @@ static void ggml_cuda_op_mul_mat_cublas(
                         &beta,   dst_dd_i, CUDA_R_32F, ldc,
                         CUBLAS_COMPUTE_32F,
                         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            }
         } else {
             ggml_cuda_pool_alloc<half> dst_f16(ctx.pool(id), row_diff*src1_ncols);
 
@@ -1811,16 +1840,31 @@ static void ggml_cuda_op_mul_mat_cublas(
         const float * src0_ddf_i = src0->type == GGML_TYPE_F32 ? (const float *) src0_dd_i : src0_ddq_as_f32.get();
         const float * src1_ddf1_i = src1->type == GGML_TYPE_F32 ? (const float *) src1_ddf_i : src1_ddq_as_f32.get();
 
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
+#ifdef GGML_USE_HIP
+        // GFX906 custom SGEMM for medium batch sizes
+        bool handled = false;
+        if (GGML_CUDA_CC_IS_GCN(cc)) {
+            handled = gfx906_sgemm_dispatch(
+                src0_ddf_i, src1_ddf1_i, dst_dd_i,
+                (int)row_diff, (int)src1_ncols, (int)ne10,
+                (int)ne00, (int)ne10, (int)ldc,
+                stream
+            );
+        }
+        if (!handled)
+#endif
+        {
+            const float alpha = 1.0f;
+            const float beta = 0.0f;
 
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
-        CUBLAS_CHECK(
-            cublasSgemm(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
-                    row_diff, src1_ncols, ne10,
-                    &alpha, src0_ddf_i,  ne00,
-                            src1_ddf1_i, ne10,
-                    &beta,  dst_dd_i,    ldc));
+            CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+            CUBLAS_CHECK(
+                cublasSgemm(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                        row_diff, src1_ncols, ne10,
+                        &alpha, src0_ddf_i,  ne00,
+                                src1_ddf1_i, ne10,
+                        &beta,  dst_dd_i,    ldc));
+        }
     }
 
     GGML_UNUSED_VARS(dst, src1_ddq_i, src1_padded_row_size);
@@ -3338,6 +3382,37 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             }
         }
 
+#ifdef GGML_USE_HIP
+        // GFX906/GCN: Disable CUDA graphs for SOLVE_TRI (batched TRSM crashes on ROCm)
+        // Qwen3-Next and other hybrid models use SOLVE_TRI for recurrent layers
+        if (node->op == GGML_OP_SOLVE_TRI) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to SOLVE_TRI on ROCm\n", __func__);
+#endif
+        }
+#endif
+
+        if (node->op == GGML_OP_ADD &&
+            node->src[1] && node->src[1]->ne[1] > 1 &&
+            (node->src[0] ? node->src[0]->name != gemma3n_per_layer_proj_src0_name : true) &&
+            (node->src[1] ? node->src[1]->name != gemma3n_per_layer_proj_src1_name : true) &&
+            strncmp(node->name, ffn_moe_gate_bias_prefix.c_str(), ffn_moe_gate_bias_prefix.size()) != 0 &&
+            strncmp(node->name, ffn_moe_up_bias_prefix.c_str(), ffn_moe_up_bias_prefix.size()) != 0 &&
+            strncmp(node->name, ffn_moe_down_bias_prefix.c_str(), ffn_moe_down_bias_prefix.size()) != 0 &&
+            strncmp(node->name, nemotron_h_block_out_prefix.c_str(), nemotron_h_block_out_prefix.size()) != 0 &&
+            strncmp(node->name, mamba2_y_add_d_prefix.c_str(), mamba2_y_add_d_prefix.size()) != 0) {
+            // disable CUDA graphs for batch size > 1 for now while excluding the matrix-matrix addition as part of Gemma3n's `project_per_layer_input` operation
+            // by means of matching node names. See
+            // https://github.com/ggml-org/llama.cpp/blob/f9a31eea06a859e34cecb88b4d020c7f03d86cc4/src/llama-model.cpp#L10199-L10241 and
+            // https://github.com/huggingface/transformers/blob/bda75b4011239d065de84aa3e744b67ebfa7b245/src/transformers/models/gemma3n/modeling_gemma3n.py#L1773,
+            // Generally, changes in batch size or context size can cause changes to the grid size of some kernels.
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
+#endif
+        }
+
         if (!use_cuda_graph) {
             break;
         }
@@ -4292,6 +4367,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
 
+#if defined(GGML_USE_HIP) && GFX906_KVQ_MOE_CACHE_ENABLED
+    cuda_ctx->clear_q8_cache();
+#endif
+
     ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context();
     bool                         is_concurrent_event_active = false;
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
@@ -4320,6 +4399,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
+#if defined(GGML_USE_HIP) && GFX906_KVQ_MOE_CACHE_ENABLED
+            // Sync before clearing fusion buffers (skip during graph capture)
+            if (!cuda_ctx->fusion_q8_buffers.empty() && !use_cuda_graph) {
+                CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+            }
+            clear_fusion_state(cuda_ctx);
+#endif
             [[maybe_unused]] int prev_i = 0;
 
             if (stream_ctx.concurrent_events.size() > 0) {
@@ -4438,6 +4524,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     i += nodes_to_skip;
                     continue;
                 }
+
+#if defined(GGML_USE_HIP) && GFX906_KVQ_MOE_CACHE_ENABLED
+                if (try_rms_mul_mmq_fusion(cuda_ctx, cgraph, i, use_cuda_graph, cuda_graph_update_required)) {
+                    continue;
+                }
+#endif
+
+#if defined(GGML_USE_HIP) && GFX906_KVQ_MOE_CACHE_ENABLED
+                if (is_mul_handled_by_fusion(cuda_ctx, node)) {
+                    continue;
+                }
+                if (try_prequantized_mul_mat(cuda_ctx, node)) {
+                    continue;
+                }
+#endif
+
 #ifndef NDEBUG
                 assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -5493,6 +5595,20 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_TRI:
         case GGML_OP_DIAG:
         case GGML_OP_SOLVE_TRI:
+#if defined(GGML_USE_HIP)
+            // GFX906: limit SOLVE_TRI dimensions to avoid rocBLAS batched TRSM crashes
+            // Qwen3-Next and other hybrid models use SOLVE_TRI for recurrent layers
+            {
+                const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+                if (GGML_CUDA_CC_IS_GCN(cc)) {
+                    // Check for NULL sources before accessing dimensions
+                    if (op->src[0] && op->src[1]) {
+                        return op->src[0]->ne[0] <= 64 && op->src[1]->ne[0] <= 32;
+                    }
+                    return false; // Fall back to CPU if sources not available
+                }
+            }
+#endif
             return true;
 
         default:
