@@ -80,8 +80,7 @@ MODEL_PATH="/AI/Models/Qwen3.6-27B/gguf/output-mtp.gguf"
     -ub 2048 \
   --chat-template-file "/AI/Models/Qwen3.6-27B/gguf/template.jinja" \
   --metrics \
-    --jinja \
-    -v --verbosity 9
+    --jinja 
     # --mmproj "$MMPROJ_PATH"
     
     

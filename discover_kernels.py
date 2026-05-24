@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-import argparse, subprocess, re, csv, os
+import argparse, subprocess, re, csv, os, shlex
 from pathlib import Path
-import matplotlib.pyplot as plt
+
+os.environ.setdefault("MPLCONFIGDIR", str(Path(os.environ.get("TMPDIR", "/tmp")) / "llama-cpp-matplotlib"))
+
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    plt = None
 
 LLAMA_BENCH_SCRIPT = "./SCRIPT_llama_bench.sh"
 GFX906_ENV = {
     'HSA_OVERRIDE_GFX_VERSION': '9.0.6', 'HIP_VISIBLE_DEVICES': '0',
-    'CUDA_VISIBLE_DEVICES': '0', 'ROCR_VISIBLE_DEVICES': '0',
+    'ROCR_VISIBLE_DEVICES': '0',
     'GGML_BACKEND_HIP': '1', 'HCC_AMDGPU_TARGET': 'gfx906',
     'GGML_CUDA_DISABLE_GRAPHS': '1',
 }
@@ -20,9 +26,9 @@ def run_rocprofv3(command: str, output_dir: Path) -> Path:
     env = os.environ.copy()
     env.update(GFX906_ENV)
     cmd = ["rocprofv3", "--kernel-trace", "--stats", "-d", str(output_dir),
-           "-o", "kernels", "-f", "csv", "--"] + command.split()
+           "-o", "kernels", "-f", "csv", "--"] + shlex.split(command)
     print(f"Running: {' '.join(cmd)}\nThis may take several minutes...")
-    subprocess.run(cmd, env=env, timeout=1200)
+    subprocess.run(cmd, env=env, timeout=1200, check=True)
     return next(output_dir.glob("*kernel_stats.csv"))
 
 def parse_stats_csv(stats_file: Path) -> list[dict]:
@@ -47,6 +53,8 @@ def short_name(name: str) -> str:
     return name
 
 def plot_chart(analysis: dict, output_dir: Path, top_n: int = 15):
+    if plt is None:
+        return
     kernels = analysis['hot_kernels'][:top_n]
     if not kernels:
         return
@@ -107,16 +115,20 @@ def print_report(analysis: dict, top_n: int = 20):
     print("-"*80)
 
 def save_results(analysis: dict, output_dir: Path):
-    with open(output_dir / 'kernels.csv', 'w') as f:
-        f.write("rank,name,short_name,calls,total_ns,pct\n")
+    with open(output_dir / 'kernels.csv', 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["rank", "name", "short_name", "calls", "total_ns", "pct"])
         for i, k in enumerate(analysis['kernels'], 1):
-            f.write(f"{i},{k['name']},{short_name(k['name'])},"
-                    f"{k['calls']},{k['total_ns']},{k['pct']:.2f}\n")
+            writer.writerow([i, k['name'], short_name(k['name']),
+                             k['calls'], k['total_ns'], f"{k['pct']:.2f}"])
     with open(output_dir / 'hot_kernels.txt', 'w') as f:
         for k in analysis['hot_kernels']:
             f.write(f"{short_name(k['name'])}  # {k['pct']:.1f}%\n")
     plot_chart(analysis, output_dir)
-    print(f"Saved: {output_dir}/kernels.csv, hot_kernels.txt, kernel_pareto.png")
+    outputs = ["kernels.csv", "hot_kernels.txt"]
+    if plt is not None:
+        outputs.append("kernel_pareto.png")
+    print(f"Saved: {output_dir}/" + f", {output_dir}/".join(outputs))
 
 def main():
     p = argparse.ArgumentParser(description='Discover GPU kernels using rocprofv3')
@@ -124,10 +136,12 @@ def main():
     p.add_argument('-t', '--threshold', type=float, default=1.0)
     p.add_argument('-n', '--top', type=int, default=20)
     p.add_argument('-e', '--existing', metavar='CSV')
+    p.add_argument('-c', '--command', default=LLAMA_BENCH_SCRIPT,
+                   help='command to run under rocprofv3 when --existing is not used')
     args = p.parse_args()
     output_dir = Path(args.output).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    stats_file = Path(args.existing) if args.existing else run_rocprofv3(LLAMA_BENCH_SCRIPT, output_dir)
+    stats_file = Path(args.existing) if args.existing else run_rocprofv3(args.command, output_dir)
     analysis = analyze_kernels(parse_stats_csv(stats_file), args.threshold)
     print_report(analysis, args.top)
     save_results(analysis, output_dir)
