@@ -115,7 +115,7 @@ __global__ void __launch_bounds__(splitD, 1)
 #endif // __clang__
 
 // assumes as many threads as d_state
-template <int splitH, int d_state>
+template <int c_factor, int d_state>
 __global__ void __launch_bounds__(d_state, 1)
     ssm_scan_f32_group(
         const float * __restrict__ src0, const float * __restrict__ src1, const float * __restrict__ src2,
@@ -126,9 +126,13 @@ __global__ void __launch_bounds__(d_state, 1)
         const int src4_nb2, const int src4_nb3, const int src5_nb2, const int src5_nb3,
         const int64_t s_off, const int64_t n_head, const int64_t d_head, const int64_t n_group, const int64_t n_tok) {
 
-    const int head_idx = (blockIdx.x * splitH) / d_head;
-    const int head_off = ((blockIdx.x * splitH) % d_head) * sizeof(float);
-    const int seq_idx = blockIdx.y;
+    const int warp     = threadIdx.x / WARP_SIZE;
+    const int lane     = threadIdx.x % WARP_SIZE;
+    const int warp_idx = blockIdx.x  * c_factor + warp;
+
+    const int head_idx =  warp_idx / d_head;
+    const int head_off = (warp_idx % d_head) * sizeof(float);
+    const int seq_idx  = blockIdx.y;
 
     const int group_off = (head_idx / (n_head / n_group)) * d_state * sizeof(float);
 
@@ -150,80 +154,42 @@ __global__ void __launch_bounds__(d_state, 1)
     const int stride_C  = src5_nb2 / sizeof(float);
     const int stride_y  = n_head * d_head;
 
-    float state[splitH];
-    // for the parallel accumulation
-    __shared__ float stateC[splitH * d_state];
+    float state[c_factor];
+    float state_sum = 0.0f;
 
 #pragma unroll
-    for (int j = 0; j < splitH; j++) {
-        state[j] = s0_block[j * d_state + threadIdx.x];
+    for (int j = 0; j < c_factor; j++) {
+        state[j] = s0_warp[WARP_SIZE * j + lane];
     }
 
     for (int64_t i = 0; i < n_tok; i++) {
-        // TODO: only calculate dA and dt_soft_plus once per head instead of every splitH head elements
-        // TODO: only calculate B and C once per head group
-        // NOTE: dt_soft_plus, dA and x_dt have the same value across threads here.
-        float dt_soft_plus = dt_block[i * stride_dt];
-        if (dt_soft_plus <= 20.0f) {
-            dt_soft_plus = log1pf(expf(dt_soft_plus));
-        }
-        const float dA = expf(dt_soft_plus * A_block[0]);
-        const float B = B_block[i * stride_B + threadIdx.x];
-        const float C = C_block[i * stride_C + threadIdx.x];
+        // NOTE: dt_soft_plus, dA and x_dt have the same value for a warp here.
+        // Recalculation is intentional; sharing via shuffles/smem proved slower due to sync overhead.
+        const float dt_soft_plus = (dt_warp[i * stride_dt] <= 20.0f ? log1pf(expf(dt_warp[i * stride_dt])) : dt_warp[i * stride_dt]);
 
-        // across d_head
+        state_sum = 0.0f;
+        const float dA   = expf(dt_soft_plus * A_warp[0]);
+        const float x_dt = x_warp[i * stride_x] * dt_soft_plus;
 #pragma unroll
-        for (int j = 0; j < splitH; j++) {
-            const float x_dt = x_block[i * stride_x + j] * dt_soft_plus;
-
-            state[j] = (state[j] * dA) + (B * x_dt);
-
-            stateC[j * d_state + threadIdx.x] = state[j] * C;
+        for (int j = 0; j < c_factor; j++) {
+            const float B_val = B_warp[i * stride_B + WARP_SIZE * j + lane];
+            const float C_val = C_warp[i * stride_C + WARP_SIZE * j + lane];
+            state[j] = (state[j] * dA) + (B_val * x_dt);
+            state_sum += state[j] * C_val;
         }
 
-        __syncthreads();
+        // parallel accumulation for output
+        state_sum = warp_reduce_sum(state_sum);
 
-        // parallel accumulation for stateC
-        // TODO: simplify
-        {
-            static_assert((d_state & -d_state) == d_state, "the state size has to be a power of 2");
-            static_assert((splitH & -splitH) == splitH, "splitH has to be a power of 2");
-
-            // reduce until w matches the warp size
-            // TODO: does this work even when the physical warp size is 64?
-#pragma unroll
-            for (int w = d_state; w > WARP_SIZE; w >>= 1) {
-                // (assuming there are d_state threads)
-#pragma unroll
-                for (int j = 0; j < ((w >> 1) * splitH + d_state - 1) / d_state; j++) {
-                    // TODO: check for bank conflicts
-                    const int k = (threadIdx.x % (w >> 1)) + (d_state * (threadIdx.x / (w >> 1))) + j * d_state * (d_state / (w >> 1));
-                    stateC[k] += stateC[k + (w >> 1)];
-
-                }
-                __syncthreads();
-            }
-
-            static_assert(splitH >= d_state / WARP_SIZE);
-
-#pragma unroll
-            for (int j = 0; j < splitH / (d_state / WARP_SIZE); j++) {
-                float y = stateC[(threadIdx.x % WARP_SIZE) + d_state * (threadIdx.x / WARP_SIZE) + j * d_state * (d_state / WARP_SIZE)];
-                y = warp_reduce_sum(y);
-
-                // store the above accumulations
-                if (threadIdx.x % WARP_SIZE == 0) {
-                    const int k = threadIdx.x / WARP_SIZE + j * (d_state / WARP_SIZE);
-                    y_block[i * stride_y + k] = y;
-                }
-            }
+        if (lane == 0) {
+            y_warp[i * stride_y] = state_sum;
         }
     }
 
     // write back the state
 #pragma unroll
-    for (int j = 0; j < splitH; j++) {
-        s_block[j * d_state + threadIdx.x] = state[j];
+    for (int j = 0; j < c_factor; j++) {
+        s_warp[WARP_SIZE * j + lane] = state[j];
     }
 }
 
@@ -234,7 +200,6 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
                               const int src5_nb3, const int64_t s_off, const int64_t d_state, const int64_t head_dim,
                               const int64_t n_head, const int64_t n_group, const int64_t n_tok, const int64_t n_seq,
                               cudaStream_t stream) {
-    const int threads = 128;
     // NOTE: if you change conditions here, be sure to update the corresponding supports_op condition!
     if (src3_nb1 == sizeof(float)) {
         // Mamba-2
@@ -263,6 +228,7 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
         }
     } else {
         // Mamba-1
+        constexpr int threads = 128;
         GGML_ASSERT(n_head % threads == 0);
         GGML_ASSERT(head_dim == 1);
         GGML_ASSERT(n_group == 1);

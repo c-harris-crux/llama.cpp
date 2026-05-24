@@ -21,6 +21,8 @@ export HSA_OVERRIDE_GFX_VERSION=9.0.6
 export HIP_VISIBLE_DEVICES=0
 
 MODEL_PATH="/path/..."
+MODEL_PATH="/AI/Models/Qwen3.6-27B/gguf/output-mtp.gguf"
+
 LOG_FILE="bench_results.md"
 
 
@@ -53,7 +55,7 @@ echo ""
 cd "$(dirname "$0")" || exit
 [ ! -f "./build/bin/llama-bench" ] && echo "Error: llama-bench not found" && exit 1
 
-./build/bin/llama-bench "${BENCH_PARAMS[@]}" "$BENCH_TESTS" "$@" 2>&1 | tee -a "$LOG_FILE"
+./build/bin/llama-bench "${BENCH_PARAMS[@]}" $BENCH_TESTS "$@" 2>&1 | tee -a "$LOG_FILE"
 
 echo ""
 echo "Output saved to: $LOG_FILE"

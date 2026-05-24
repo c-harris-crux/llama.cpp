@@ -446,20 +446,13 @@ static void rope_multi_cuda(const T *            x,
                             const bool           is_imrope,
                             cudaStream_t         stream) {
     GGML_ASSERT(ne00 % 2 == 0);
-//template<bool forward, typename T>
-//static void rope_multi_cuda(
-//        const T * x, T * dst, const int ne0, const int ne1, const int ne2, const int s1, const int s2, const int n_dims, const int nr,
-//        const int32_t * pos, const float freq_scale, const float freq_base, const float ext_factor, const float attn_factor,
-//        const rope_corr_dims corr_dims, const float * freq_factors, const mrope_sections sections, const bool is_imrope, cudaStream_t stream) {
-//    GGML_ASSERT(ne0 % 2 == 0);
-
 #if defined(GGML_HIP_GFX906) && defined(GFX906_ROPE_ENABLED)
     // GFX906-optimized kernel using __sincosf and precomputed theta_power
     const gfx906_rope_corr_dims & gfx906_corr = reinterpret_cast<const gfx906_rope_corr_dims &>(corr_dims);
     const gfx906_mrope_sections & gfx906_sects = reinterpret_cast<const gfx906_mrope_sections &>(sections);
 
     gfx906_rope_multi_cuda<forward, T>(
-        x, dst, ne0, ne1, ne2, s1, s2, n_dims, nr,
+        x, dst, ne00, ne01, ne02, s01, s02, n_dims, nr,
         pos, freq_scale, freq_base, ext_factor, attn_factor,
         gfx906_corr, freq_factors, gfx906_sects, is_imrope, stream);
 #else

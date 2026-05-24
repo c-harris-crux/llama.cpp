@@ -1318,8 +1318,8 @@ void launch_fattn(
         hip_f16_alloc & operator=(const hip_f16_alloc &) = delete;
         ~hip_f16_alloc() {
             if (ptr) {
-                cudaStreamSynchronize(stream);
-                cudaFree(ptr);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                CUDA_CHECK(cudaFree(ptr));
             }
         }
         void alloc(size_t nelements) {
