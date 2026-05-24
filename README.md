@@ -1,21 +1,17 @@
-# llama.cpp
+### UPDATE: this fork is not updated. It will be updated asap and all the best changes will be pred to the upstream!
 
-![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
+# llama.cpp-gfx906-2602
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp)](https://github.com/ggml-org/llama.cpp/releases)
-[![Server](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
+Based on llama.cpp build 7924.
 
-[Manifesto](https://github.com/ggml-org/llama.cpp/discussions/205) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md)
 
-LLM inference in C/C++
 
-## Recent API changes
+## Benchmark Results
 
-- [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)
-- [Changelog for `llama-server` REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+![Benchmark Results](benchmarks.svg)
 
-## Hot topics
+See [SCRIPT_llama_bench.sh](SCRIPT_llama_bench.sh) for llama-bench configuration and [SCRIPT_launch_server_MI50.sh](SCRIPT_launch_server_MI50.sh) for server launch settings.
+
 
 - **Hugging Face cache migration: models downloaded with `-hf` are now stored in the standard Hugging Face cache directory, enabling sharing with other HF tools.**
 - **[guide : using the new WebUI of llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/16938)**
@@ -29,33 +25,40 @@ LLM inference in C/C++
 - Hugging Face GGUF editor: [discussion](https://github.com/ggml-org/llama.cpp/discussions/9268) | [tool](https://huggingface.co/spaces/CISCai/gguf-editor)
 - WebGPU support is now available in the browser, see a blog/demo introducing it [here](https://reeselevine.github.io/llamas-on-the-web/).
 
-----
+## What Changed
 
-## Quick start
-
-Getting started with llama.cpp is straightforward. Here are several ways to install it on your machine:
-
-- Install `llama.cpp` using [brew, nix or winget](docs/install.md)
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
-
-Once installed, you'll need a model to work with. Head to the [Obtaining and quantizing models](#obtaining-and-quantizing-models) section to learn more.
-
-Example command:
-
-```sh
-# Use a local model file
-llama-cli -m my_model.gguf
-
-# Or download and run a model directly from Hugging Face
-llama-cli -hf ggml-org/gemma-3-1b-it-GGUF
-
-# Launch OpenAI-compatible API server
-llama-server -hf ggml-org/gemma-3-1b-it-GGUF
+The core modifications are implemented in ggml-cuda/gfx906 folder.
+### 2602
+```
+  ggml/src/ggml-cuda/gfx906/
+  ├── gfx906-common.cuh          - DPP warp reductions & common utilities
+  ├── gfx906-config.h            - Feature toggles
+  ├── attention/
+  │   ├── fattn-q8.cuh           - Q8 FlashAttention kernel
+  │   ├── fattn-q8.cu            - Instance launcher
+  │   ├── rope.cuh               - Optimized RoPE kernel
+  │   └── instances/             - Template instantiations for various head dims
+  ├── fused/
+  │   ├── gather-q8.cuh          - Q8 gather helpers
+  │   ├── gather-q8.cu           - Q8 gather kernel
+  │   ├── graph-fusion.cuh       - Graph fusion logic
+  │   ├── mmq-prequantized.cuh   - Prequantized MMQ helpers
+  │   ├── norm-fused-q8.cuh      - Fused norm dispatch
+  │   └── norm-fused-q8.cu       - Fused norm kernels
+  ├── matmul/
+  │   ├── mmf.cuh                - MMF (mul-mat-fused) helpers
+  │   ├── mmq.cuh                - MMQ vectorized loads
+  │   ├── mmq-prefetch.cuh       - Prefetch helpers
+  │   ├── mmvq-q4_0.cuh          - Warp-cooperative MMVQ Q4_0
+  │   ├── mmvq-q4_1.cuh          - Warp-cooperative MMVQ Q4_1
+  │   ├── mmvq-q8_0.cuh          - Warp-cooperative MMVQ Q8_0
+  │   └── sgemm.cuh              - SGEMM helpers
+  └── quantize/
+      ├── epilogue.cuh           - DPP-based Q8_1 epilogue
+      ├── q8-cache.cuh           - Q8 cross-op cache
+      └── vecdotq.cuh            - MXFP4 vectorized loads
 ```
 
-## Description
 
 The main goal of `llama.cpp` is to enable LLM inference with minimal setup and state-of-the-art performance on a wide
 range of hardware - locally and in the cloud.
@@ -572,28 +575,77 @@ let package = Package(
         )
     ]
 )
+### 2601
 ```
-The above example is using an intermediate build `b5046` of the library. This can be modified
-to use a different version by changing the URL and checksum.
+gfx906-mmvq-q4_0.cuh Warp-cooperative Q4_0 MMVQ kernel
+gfx906-mmvq-q4_1.cuh Warp-cooperative Q4_1 MMVQ kernel
+gfx906-mmvq-q8_0.cuh Warp-cooperative Q8_0 MMVQ kernel
+mmvq.cu              Half-warp (32 threads) dispatch for MoE small matrices
+```
 
-## Completions
-Command-line completion is available for some environments.
+### 2512
+```
+mmq.cuh              Software pipelining for Q8_0 MMQ loads
+mmq.cuh              Optimized Q8 MMQ need_check path to avoid LDS conflicts
+mmq.cuh              MXFP4 load pipeline with e8m0 conversion optimization
+vecdotq.cuh          Fast Q8_0 load path using memcpy
+vecdotq.cuh          Software pipeline MXFP4 MMVQ for v_perm latency hiding
+vecdotq.cuh          MXFP4 lookup with 2-perm + arithmetic sign
+mmq.cu/mmid.cu       MoE sub-warp shuffle fix for wavefront64 (fixes gpt-oss loading problems)
+```
 
-#### Bash Completion
+### 2511
+
+```
+common.cuh           DPP-based warp reductions with unified shuffle XOR dispatch
+fattn-common.cuh     GCN-optimized thread counts and tile configurations
+fattn.cu             Q8-optimized tile kernel selection for GFX906 flash attention
+mmq.cu               Integrated GFX906 vectorized loads for Q4_0/Q4_1 quantizations
+gfx906/              New directory with MI50/MI60-specific kernel implementations
+```
+
+
+## Quick Start
+
+Optional but sometimes required, set your paths for rocm and device libs if they are not in /opt/rocm/
+
 ```bash
-$ build/bin/llama-cli --completion-bash > ~/.llama-completion.bash
-$ source ~/.llama-completion.bash
-```
-Optionally this can be added to your `.bashrc` or `.bash_profile` to load it
-automatically. For example:
-```console
-$ echo "source ~/.llama-completion.bash" >> ~/.bashrc
+export ROCM_PATH=/opt/rocm-7.1.0 #optional
+export HIP_DEVICE_LIB_PATH=/opt/rocm-7.1.0/amdgcn/bitcode #optional
 ```
 
-## Dependencies
+```bash
+git clone https://github.com/iacopPBK/llama.cpp-gfx906.git
+cd llama.cpp-gfx906
+./SCRIPT_compile_MI50.sh      # edit ROCM_PATH if not using /opt/rocm
+./SCRIPT_launch_server_MI50.sh # edit MODEL_PATH to your model file
+./SCRIPT_llama_bench.sh # edit MODEL_PATH to your model file, performs the bench shown above
 
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [stb-image](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+```
+
+Tested with ROCm 7.1.1 and GFX906 GPU (MI50/MI60).
+
+
+
+## Power Scaling
+
+Performance scales with power limit using [SCRIPT_overclock_upp_MI50.sh](https://github.com/sibradzic/upp) for MI50 overclocking via UPP (Powerplay Table Editor). Results gathered using 2511 release.
+
+![PP Performance](power_sweep_pp.svg)
+
+![TG Performance](power_sweep_tg.svg)
+
+
+
+## Special Thanks and Links
+Props to these users for spending time on the repo.
+
+[@fuutott](https://github.com/fuutott) ・ [@mircoboschi](https://github.com/mircoboschi) ・ [@skyne98](https://github.com/skyne98) ・ [@kamali-lab](https://https://github.com/kamali-lab)
+
+---
+
+[AMD GCN ISA](https://gpuopen.com/learn/amdgcn-assembly/) ・ [llama.cpp](https://github.com/ggml-org/llama.cpp) ・ [ROCm](https://rocm.docs.amd.com/) ・ [GFX906 DISCORD](https://discord.gg/ZEcgt3dAw) ・ [wiki-gfx906](https://github.com/skyne98/wiki-gfx906) ・ [llama-labs-gfx906](https://github.com/skyne98/llama-labs-gfx906)
+
+
+
+<sub>Built for the GFX906 community</sub>

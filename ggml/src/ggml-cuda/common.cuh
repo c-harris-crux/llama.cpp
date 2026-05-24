@@ -29,7 +29,15 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <unordered_set>
 #include <vector>
+
+#if defined(GGML_HIP_GFX906)
+#include "gfx906/gfx906-config.h"
+#if GFX906_KVQ_MOE_CACHE_ENABLED
+#include "gfx906/quantize/q8-cache.cuh"
+#endif
+#endif
 
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
@@ -426,6 +434,35 @@ struct ggml_cuda_unroll<1> {
     }
 };
 
+// ================================================================================================
+// AMD GFX906 DPP-based Warp Reductions
+// ================================================================================================
+// All AMD GFX906-specific DPP optimizations moved to gfx906/gfx906-common.cuh
+// ================================================================================================
+
+#ifdef GGML_USE_HIP
+    #include "gfx906/gfx906-common.cuh"
+#endif // GGML_USE_HIP
+
+// ============================================================================
+// Unified shuffle XOR operation - dispatches to DPP on AMD, shuffle on NVIDIA
+// ============================================================================
+template<int width = WARP_SIZE, typename T>
+static __device__ __forceinline__ T ggml_cuda_shfl_xor_sync(T x, int offset) {
+#if defined(GGML_USE_HIP)
+    switch (~offset) {
+        case ~1:  return hip_dpp_xor1(x);
+        case ~2:  return hip_dpp_xor2(x);
+        case ~4:  return hip_dpp_xor4(x);
+        case ~8:  return hip_dpp_xor8(x);
+        case ~16: return hip_dpp_xor16(x);
+        default:  return __shfl_xor(x, offset, width);
+    }
+#else
+    return __shfl_xor_sync(0xffffffff, x, offset, width);
+#endif
+}
+
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_sum(int x) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
@@ -433,7 +470,7 @@ static __device__ __forceinline__ int warp_reduce_sum(int x) {
 #else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
-        x += __shfl_xor_sync(0xffffffff, x, offset, width);
+        x += ggml_cuda_shfl_xor_sync<width>(x, offset);
     }
     return x;
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
@@ -441,19 +478,23 @@ static __device__ __forceinline__ int warp_reduce_sum(int x) {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
+#if defined(GGML_USE_HIP)
+    return warp_reduce_amd_f32<width, AddOp>(x);  // Use fused DPP instructions
+#else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
-        x += __shfl_xor_sync(0xffffffff, x, offset, width);
+        x += ggml_cuda_shfl_xor_sync<width>(x, offset);
     }
     return x;
+#endif
 }
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float2 warp_reduce_sum(float2 a) {
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
-        a.x += __shfl_xor_sync(0xffffffff, a.x, offset, width);
-        a.y += __shfl_xor_sync(0xffffffff, a.y, offset, width);
+        a.x += ggml_cuda_shfl_xor_sync<width>(a.x, offset);
+        a.y += ggml_cuda_shfl_xor_sync<width>(a.y, offset);
     }
     return a;
 }
@@ -463,10 +504,9 @@ static __device__ __forceinline__ half2 warp_reduce_sum(half2 a) {
 #ifdef FP16_AVAILABLE
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
-        a = __hadd2(a, __shfl_xor_sync(0xffffffff, a, offset, width));
+        a = __hadd2(a, ggml_cuda_shfl_xor_sync<width>(a, offset));
     }
     return a;
-
 #else
     NO_DEVICE_CODE;
     return a;
@@ -480,7 +520,7 @@ static __device__ __forceinline__ int warp_reduce_all(int x) {
     } else {
 #pragma unroll
         for (int offset = width/2; offset > 0; offset >>= 1) {
-            x = __shfl_xor_sync(0xffffffff, x, offset, width) && x;
+            x = ggml_cuda_shfl_xor_sync<width>(x, offset) && x;
         }
         return x;
     }
@@ -493,7 +533,7 @@ static __device__ __forceinline__ int warp_reduce_any(int x) {
     } else {
 #pragma unroll
         for (int offset = width/2; offset > 0; offset >>= 1) {
-            x = __shfl_xor_sync(0xffffffff, x, offset, width) || x;
+            x = ggml_cuda_shfl_xor_sync<width>(x, offset) || x;
         }
         return x;
     }
@@ -501,11 +541,15 @@ static __device__ __forceinline__ int warp_reduce_any(int x) {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_max(float x) {
+#if defined(GGML_USE_HIP)
+    return warp_reduce_amd_f32<width, MaxOp>(x);  // Use fused DPP instructions
+#else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
-        x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, offset, width));
+        x = fmaxf(x, ggml_cuda_shfl_xor_sync<width>(x, offset));
     }
     return x;
+#endif
 }
 
 template<typename T, int width = WARP_SIZE>
@@ -669,7 +713,7 @@ static __device__ __forceinline__ half2 warp_reduce_max(half2 x) {
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL || defined(GGML_USE_HIP)
 #pragma unroll
    for (int offset = width/2; offset > 0; offset >>= 1) {
-       x = ggml_cuda_hmax2(x, __shfl_xor_sync(0xffffffff, x, offset, width));
+       x = ggml_cuda_hmax2(x, ggml_cuda_shfl_xor_sync<width>(x, offset));
    }
    return x;
 #else
@@ -809,6 +853,10 @@ static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
 #if CUDART_VERSION >= 12080
     const nv_bfloat16 e = __nv_cvt_e8m0_to_bf16raw(x);
     return (float) e;
+#elif defined(GGML_USE_HIP) && defined(__gfx906__)
+    // GFX906: Branchless with direct bit cast
+    const uint32_t bits = x ? ((uint32_t)x << 23) : 0x00400000u;
+    return __uint_as_float(bits);
 #else
     uint32_t bits;
     if (x == 0) {
@@ -826,7 +874,7 @@ static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
 static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
 #if defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
     // ROCm does not support fp8 in software on devices with fp8 hardware,
-    // but CDNA3 supports only e4m3_fnuz (no inf).
+    // but CDNA3 supports only e4m3_fnuz (no inf). CDNA4 (gfx950) uses standard e4m3fn.
     const uint32_t bits = x * (x != 0x7F && x != 0xFF); // Convert NaN to 0.0f to match CPU implementation.
     const __hip_fp8_e4m3_fnuz xf = *reinterpret_cast<const __hip_fp8_e4m3_fnuz *>(&bits);
     return static_cast<float>(xf) / 2;
@@ -1449,6 +1497,10 @@ struct ggml_backend_cuda_context {
     explicit ggml_backend_cuda_context(int device) :
         device(device),
         name(GGML_CUDA_NAME + std::to_string(device)) {
+#if defined(GGML_USE_HIP) && GFX906_KVQ_MOE_CACHE_ENABLED
+        // Initialize the Q8 cache arena
+        q8_cache.init();
+#endif
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
@@ -1495,6 +1547,17 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+#if defined(GGML_USE_HIP) && GFX906_KVQ_MOE_CACHE_ENABLED
+    q8_cache_arena q8_cache;
+    std::unordered_map<const ggml_tensor*, prequantized_q8_info> fusion_prequant_map;
+    std::unordered_set<const ggml_tensor*> fusion_handled_mul_nodes;
+    // Note: No slot tracking needed - bump allocator reset handles cleanup
+
+    void new_q8_epoch() {
+        q8_cache.reset();
+    }
+#endif
 };
 
 struct ggml_cuda_mm_fusion_args_host {
@@ -1573,4 +1636,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-

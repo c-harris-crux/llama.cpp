@@ -61,7 +61,26 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
+
+# GFX906-specific source files (AMD MI50/MI60 optimizations)
+file(GLOB SRCS "../ggml-cuda/gfx906/*.cu")
+message(STATUS "GFX906 .cu files found: ${SRCS}")
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+file(GLOB SRCS "../ggml-cuda/gfx906/fused/*.cu")
+message(STATUS "GFX906 fused kernels found: ${SRCS}")
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+file(GLOB SRCS "../ggml-cuda/gfx906/attention/*.cu")
+message(STATUS "GFX906 attention kernels found: ${SRCS}")
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+file(GLOB SRCS "../ggml-cuda/gfx906/attention/instances/*.cu")
+message(STATUS "GFX906 attention instances found: ${SRCS}")
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
+# Exclude D>=576 tile kernels: exceed HIP local memory limit (67584 > 65536)
+list(FILTER SRCS EXCLUDE REGEX "dkq(576|640)")
+# Exclude Q8 instances if they're in root (moved to gfx906/)
+list(FILTER SRCS EXCLUDE REGEX ".*fattn-tile-q8.*")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
@@ -79,7 +98,22 @@ else()
         ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu)
+        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo3_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo2_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-q8_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo2_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo2_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo3_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo4_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-q8_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo4_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo4_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo2_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo4_0.cu)
 endif()
 
 ggml_add_backend_library(ggml-hip
@@ -128,6 +162,16 @@ endif()
 
 if (GGML_HIP_EXPORT_METRICS)
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps")
+endif()
+
+if (GGML_HIP_NO_HIPBLASLT)
+    add_compile_definitions(GGML_HIP_NO_HIPBLASLT)
+endif()
+
+# GFX906 optimizations: enable if targeting gfx906 (MI50/MI60/Radeon VII)
+if (GGML_HIP_GFX906 OR CMAKE_HIP_ARCHITECTURES MATCHES "gfx906")
+    add_compile_definitions(GGML_HIP_GFX906)
+    message(STATUS "GFX906 optimizations enabled (warp-cooperative Q4_1 MMVQ)")
 endif()
 
 if (NOT GGML_CUDA_FA)

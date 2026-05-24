@@ -48,10 +48,7 @@ if (CUDAToolkit_FOUND)
                 #     check Modules/Internal/CMakeCUDAArchitecturesValidate.cmake in the CMake git repository instead.
                 # However, the architectures 120a-real and 121a-real should work with basically any CMake version and
                 #     until the release of e.g. Rubin there is no benefit to shipping virtual architectures for Blackwell.
-                list(APPEND CMAKE_CUDA_ARCHITECTURES 120a-real)
-            endif()
-            if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.9")
-                list(APPEND CMAKE_CUDA_ARCHITECTURES 121a-real)
+                list(APPEND CMAKE_CUDA_ARCHITECTURES 120a-real 121a-real)
             endif()
         endif()
     endif()
@@ -111,6 +108,12 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/mmf*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+    file(GLOB   SRCS "gfx906/fused/*.cu")
+    list(APPEND GGML_SOURCES_CUDA ${SRCS})
+    file(GLOB   SRCS "gfx906/attention/*.cu")
+    list(APPEND GGML_SOURCES_CUDA ${SRCS})
+    file(GLOB   SRCS "gfx906/attention/instances/*.cu")
+    list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
     if (GGML_CUDA_FA_ALL_QUANTS)
         file(GLOB   SRCS "template-instances/fattn-vec*.cu")
@@ -121,7 +124,22 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-f16-f16.cu
             template-instances/fattn-vec-instance-q4_0-q4_0.cu
             template-instances/fattn-vec-instance-q8_0-q8_0.cu
-            template-instances/fattn-vec-instance-bf16-bf16.cu)
+            template-instances/fattn-vec-instance-bf16-bf16.cu
+            template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
+            template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
+            template-instances/fattn-vec-instance-q8_0-turbo3_0.cu
+            template-instances/fattn-vec-instance-turbo2_0-turbo2_0.cu
+            template-instances/fattn-vec-instance-turbo2_0-q8_0.cu
+            template-instances/fattn-vec-instance-q8_0-turbo2_0.cu
+            template-instances/fattn-vec-instance-turbo3_0-turbo2_0.cu
+            template-instances/fattn-vec-instance-turbo2_0-turbo3_0.cu
+            template-instances/fattn-vec-instance-turbo4_0-turbo4_0.cu
+            template-instances/fattn-vec-instance-turbo4_0-q8_0.cu
+            template-instances/fattn-vec-instance-q8_0-turbo4_0.cu
+            template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu
+            template-instances/fattn-vec-instance-turbo3_0-turbo4_0.cu
+            template-instances/fattn-vec-instance-turbo4_0-turbo2_0.cu
+            template-instances/fattn-vec-instance-turbo2_0-turbo4_0.cu)
     endif()
 
     ggml_add_backend_library(ggml-cuda
