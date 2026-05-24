@@ -6,6 +6,9 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
+#include <cstdlib>
+#include <cstring>
+
 // GFX906 Q8 Flash Attention kernel
 #ifdef GGML_USE_HIP
     #include "gfx906/attention/fattn-q8.cuh"
@@ -389,6 +392,17 @@ enum best_fattn_kernel {
 #endif
 };
 
+#if defined(GGML_USE_HIP) && defined(GGML_HIP_GFX906)
+static bool ggml_cuda_gfx906_fattn_q8_tile_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_GFX906_FA_Q8_TILE");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+
+    return enabled;
+}
+#endif
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -541,6 +555,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // Force VEC path which does inline dequant with zero temp buffer overhead.
     // Trade-off: prefill is slower (sequential query processing).
     // Limitation: head_dim > 256 cannot use VEC (falls through to TILE).
+#if defined(GGML_HIP_GFX906)
+    if (ggml_cuda_gfx906_fattn_q8_tile_enabled() && Q->ne[1] <= 512 &&
+            (K->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q8_0)) {
+        const bool q8_head_size_supported = (K->ne[0] % 32 == 0) &&
+                                            (K->ne[0] != 40) &&
+                                            (K->ne[0] != 80) &&
+                                            (K->ne[0] != 112) &&
+                                            (K->ne[0] != 576);
+
+        if (q8_head_size_supported) {
+            return BEST_FATTN_KERNEL_TILE_Q8;
+        }
+    }
+#endif
     if ((ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && can_use_vector_kernel) {
         return BEST_FATTN_KERNEL_VEC;
     }
